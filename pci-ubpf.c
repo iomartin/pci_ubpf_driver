@@ -94,11 +94,21 @@ out:
     return retval;
 }
 
+int pci_ubpf_mmap (struct file *filp, struct vm_area_struct *vma)
+{
+    struct pci_ubpf_dev *p = filp->private_data;
+    ssize_t bar_len = pci_resource_len(p->pdev, BAR);
+    unsigned long start = pci_resource_start(p->pdev, BAR);
+
+    return vm_iomap_memory(vma, start, bar_len);
+}
+
 static const struct file_operations pci_ubpf_fops = {
     .owner = THIS_MODULE,
     .open =  pci_ubpf_open,
     .read =  pci_ubpf_read,
     .write = pci_ubpf_write,
+    .mmap =  pci_ubpf_mmap,
 };
 
 static void pci_ubpf_release(struct device *dev)
