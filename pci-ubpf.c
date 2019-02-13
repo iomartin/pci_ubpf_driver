@@ -9,6 +9,12 @@
 #define PCI_VENDOR_EIDETICOM 0x1de5
 #define PCI_QEMU_DEVICE_ID   0x3000
 
+#define KiB                  (1*1024)
+#define MiB                  (KiB*1024)
+
+#define P2PDMA_SIZE          (8*MiB)
+#define P2PDMA_OFFSET        0x800000
+
 #define BAR 4
 
 MODULE_LICENSE("GPL");
@@ -186,6 +192,12 @@ static int pci_ubpf_probe(struct pci_dev *pdev,
         dev_err(&pdev->dev, "unable to enable device!\n");
         goto out;
     }
+
+    if (pci_p2pdma_add_resource(pdev, BAR, P2PDMA_SIZE, P2PDMA_OFFSET)) {
+        dev_err(&pdev->dev, "unable to add p2p resource");
+        goto out_disable_device;
+    }
+    pci_p2pmem_publish(pdev, true);
 
     p = pci_ubpf_create(pdev);
     if (IS_ERR(p))
