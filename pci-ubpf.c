@@ -12,6 +12,7 @@
 #define KiB                  (1*1024)
 #define MiB                  (KiB*1024)
 
+#define EBPF_SIZE            (16*MiB)
 #define P2PDMA_SIZE          (8*MiB)
 #define P2PDMA_OFFSET        0x800000
 
@@ -109,12 +110,36 @@ int pci_ubpf_mmap (struct file *filp, struct vm_area_struct *vma)
     return vm_iomap_memory(vma, start, bar_len);
 }
 
+loff_t pci_ubpf_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct pci_ubpf *dev = filp->private_data;
+    loff_t newpos;
+    pr_info("hello %lld %d\n", off, whence);
+    switch(whence) {
+        case 0: /* SEEK_SET */
+            newpos = off;
+            break;
+        case 1: /* SEEK_CUR */
+            newpos = filp->f_pos + off;
+            break;
+        case 2: /* SEEK_END */
+            newpos = EBPF_SIZE;
+            break;
+        default: /* can't happen */
+            return -EINVAL;
+    }
+    if (newpos < 0) return -EINVAL;
+    filp->f_pos = newpos;
+    return newpos;
+}
+
 static const struct file_operations pci_ubpf_fops = {
     .owner = THIS_MODULE,
     .open =  pci_ubpf_open,
     .read =  pci_ubpf_read,
     .write = pci_ubpf_write,
     .mmap =  pci_ubpf_mmap,
+    .llseek = pci_ubpf_llseek,
 };
 
 static void pci_ubpf_release(struct device *dev)
