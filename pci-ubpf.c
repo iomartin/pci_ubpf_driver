@@ -5,6 +5,10 @@
 #include <linux/cdev.h>
 #include <linux/pfn_t.h>
 #include <linux/uaccess.h>
+#include <linux/dma-mapping.h>
+#include <linux/delay.h>
+
+#include <ebpf-offload.h>
 
 #define PCI_VENDOR_EIDETICOM 0x1de5
 #define PCI_QEMU_DEVICE_ID   0x3000
@@ -34,11 +38,27 @@ static struct pci_device_id pci_ubpf_id_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, pci_ubpf_id_table);
 
+#define UBPF_CTRL_START     0x1
+#define UBPF_CTRL_DMA_DONE  0x4
+
+#define UBPF_CMD_PROG_TEXT  0x00
+#define UBPF_CMD_PROG_DATA  0x01
+#define UBPF_CMD_RUN_PROG   0x02
+#define UBPF_CMD_GET_REGS   0x03
+#define UBPF_CMD_DUMP_MEM   0xff
+
 struct pci_ubpf_dev {
     struct device dev;
     struct pci_dev *pdev;
     int id;
     struct cdev cdev;
+    struct {
+        volatile uint8_t  __iomem *opcode;
+        volatile uint8_t  __iomem *ctrl;
+        volatile uint32_t __iomem *length;
+        volatile uint32_t __iomem *offset;
+        volatile uint64_t __iomem *addr;
+    } registers;
     void __iomem *mmio;
 };
 
@@ -110,11 +130,92 @@ int pci_ubpf_mmap (struct file *filp, struct vm_area_struct *vma)
     return vm_iomap_memory(vma, start, bar_len);
 }
 
+/* Adapted from https://stackoverflow.com/a/5540080 */
+static void program_text(struct pci_ubpf_dev *p, unsigned long addr, unsigned long nbytes)
+{
+    int n_user_pages, n_sg;
+    unsigned i, offset = 0;
+    struct device *dev = &p->pdev->dev;
+    unsigned long first_page = (addr & PAGE_MASK) >> PAGE_SHIFT;
+    unsigned long last_page = ((addr + nbytes - 1) & PAGE_MASK) >> PAGE_SHIFT;
+    unsigned first_page_offset = offset_in_page(addr);
+    unsigned npages = last_page - first_page + 1;
+    struct page **pages;
+    struct scatterlist *sgl, *sg;
+
+    pages = kcalloc(npages, sizeof(struct page *), GFP_KERNEL);
+
+    n_user_pages = get_user_pages_fast(addr, npages, 0, pages);
+    if (n_user_pages < 0) {
+        dev_err(dev, "Failed at get_user_pages(): %d\n", n_user_pages);
+        goto out_free_pages;
+    }
+
+    sgl = kcalloc(n_user_pages, sizeof(struct scatterlist *), GFP_KERNEL);
+    sg_init_table(sgl, n_user_pages);
+    /* first page */
+    sg_set_page(&sgl[0], pages[0], nbytes < (PAGE_SIZE - first_page_offset) ? nbytes : (PAGE_SIZE -first_page_offset) /* len */, offset_in_page(addr));
+    /* middle pages */
+    for(int i = 1; i < npages - 1; i++)
+        sg_set_page(&sgl[i], pages[i], PAGE_SIZE, 0);
+    /* last page */
+    if (npages > 1)
+        sg_set_page(&sgl[npages-1], pages[npages-1], nbytes - (PAGE_SIZE - first_page_offset) - ((npages-2)*PAGE_SIZE), 0);
+
+
+    n_sg = dma_map_sg(dev, sgl, n_user_pages, DMA_TO_DEVICE);
+    for_each_sg(sgl, sg, n_sg, i) {
+        unsigned tries = 0;
+        writeb(UBPF_CMD_PROG_TEXT, p->registers.opcode);
+        writel(sg_dma_len(sg), p->registers.length);
+        writeq(sg_dma_address(sg), p->registers.addr);
+        writel(offset, p->registers.offset);
+        offset += sg_dma_len(sg);
+        writeb(UBPF_CTRL_START, p->registers.ctrl);
+        /* Check if DMA is finished. This bit will be set by the device */
+        while (!(readb(p->registers.ctrl) & UBPF_CTRL_DMA_DONE)) {
+            msleep(10);
+            if (tries++ >= 10) {
+                dev_err(dev, "DMA timed out\n");
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < n_user_pages; i++) {
+        put_page(pages[i]);
+    }
+
+    dma_unmap_sg(dev, sgl, n_user_pages, DMA_TO_DEVICE);
+    kfree(sgl);
+out_free_pages:
+    kfree(pages);
+}
+
+long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct pci_ubpf_dev *p = filp->private_data;
+    struct ebpf_command *ebpf_cmd = (struct ebpf_command *) arg;
+
+    switch (ebpf_cmd->opcode) {
+        case UBPF_CMD_PROG_TEXT:
+            program_text(p, ebpf_cmd->addr, ebpf_cmd->length);
+            break;
+        default:
+            printk("Opcode %d not supported/implemented\n", ebpf_cmd->opcode);
+            break;
+    }
+
+    /* dump memory */
+    writeb(UBPF_CMD_DUMP_MEM, p->registers.opcode);
+    writeb(0x1,  p->registers.ctrl);
+
+    return 0;
+}
+
 loff_t pci_ubpf_llseek(struct file *filp, loff_t off, int whence)
 {
-    struct pci_ubpf *dev = filp->private_data;
     loff_t newpos;
-    pr_info("hello %lld %d\n", off, whence);
     switch(whence) {
         case 0: /* SEEK_SET */
             newpos = off;
@@ -140,6 +241,7 @@ static const struct file_operations pci_ubpf_fops = {
     .write = pci_ubpf_write,
     .mmap =  pci_ubpf_mmap,
     .llseek = pci_ubpf_llseek,
+    .unlocked_ioctl = pci_ubpf_ioctl,
 };
 
 static void pci_ubpf_release(struct device *dev)
@@ -179,6 +281,11 @@ static struct pci_ubpf_dev *pci_ubpf_create(struct pci_dev *pdev)
         goto out_free;
     }
     p->mmio = pci_iomap(pdev, BAR, pci_resource_len(pdev, BAR));
+    p->registers.opcode = p->mmio + 1*MiB + 0x0;
+    p->registers.ctrl   = p->mmio + 1*MiB + 0x1;
+    p->registers.length = p->mmio + 1*MiB + 0x4;
+    p->registers.offset = p->mmio + 1*MiB + 0x8;
+    p->registers.addr   = p->mmio + 1*MiB + 0xc;
 
     cdev_init(&p->cdev, &pci_ubpf_fops);
     p->cdev.owner = THIS_MODULE;
@@ -218,13 +325,21 @@ static int pci_ubpf_probe(struct pci_dev *pdev,
         goto out;
     }
 
+    if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64))) {
+        dev_err(&pdev->dev, "pci_ubpf: No suitable DMA available\n");
+        goto out_disable_device;
+    }
+
     if (pci_p2pdma_add_resource(pdev, BAR, P2PDMA_SIZE, P2PDMA_OFFSET)) {
         dev_err(&pdev->dev, "unable to add p2p resource");
         goto out_disable_device;
     }
+
+    pci_set_master(pdev);
     pci_p2pmem_publish(pdev, true);
 
     p = pci_ubpf_create(pdev);
+
     if (IS_ERR(p))
         goto out_disable_device;
 
@@ -252,22 +367,6 @@ static struct pci_driver pci_ubpf_driver = {
     .remove = pci_ubpf_remove,
 };
 
-static void create_devices(void)
-{
-    struct pci_dev *pdev = NULL;
-    struct pci_ubpf_dev *p;
-
-    while ((pdev = pci_get_device(PCI_VENDOR_EIDETICOM, PCI_QEMU_DEVICE_ID, pdev))) {
-        if (pdev)
-            pr_info("Found device: %hu %hu\n", pdev->vendor, pdev->device);
-        else
-            pr_info("Did not find device\n");
-        p = pci_ubpf_create(pdev);
-        if (!p)
-            continue;
-    }
-}
-
 static void ugly_hack_deinit(void)
 {
     struct class_dev_iter iter;
@@ -293,8 +392,6 @@ static int __init pci_ubpf_init(void)
     rc = alloc_chrdev_region(&pci_ubpf_devt, 0, max_devices, "pci_ubpf");
     if (rc)
         goto err_class;
-
-    //create_devices();
 
     rc = pci_register_driver(&pci_ubpf_driver);
     if (rc)
