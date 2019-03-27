@@ -38,15 +38,6 @@ static struct pci_device_id pci_ubpf_id_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, pci_ubpf_id_table);
 
-#define UBPF_CTRL_START     0x1
-#define UBPF_CTRL_DMA_DONE  0x4
-
-#define UBPF_CMD_PROG_TEXT  0x00
-#define UBPF_CMD_PROG_DATA  0x01
-#define UBPF_CMD_RUN_PROG   0x02
-#define UBPF_CMD_GET_REGS   0x03
-#define UBPF_CMD_DUMP_MEM   0xff
-
 struct pci_ubpf_dev {
     struct device dev;
     struct pci_dev *pdev;
@@ -131,8 +122,9 @@ int pci_ubpf_mmap (struct file *filp, struct vm_area_struct *vma)
 }
 
 /* Adapted from https://stackoverflow.com/a/5540080 */
-static void program_text(struct pci_ubpf_dev *p, unsigned long addr, unsigned long nbytes)
+static int do_dma(struct pci_ubpf_dev *p, uint8_t opcode, unsigned long addr, unsigned long nbytes)
 {
+    int ret = 0;
     int n_user_pages, n_sg;
     unsigned i, offset = 0;
     struct device *dev = &p->pdev->dev;
@@ -143,37 +135,51 @@ static void program_text(struct pci_ubpf_dev *p, unsigned long addr, unsigned lo
     struct page **pages;
     struct scatterlist *sgl, *sg;
 
-    pages = kcalloc(npages, sizeof(struct page *), GFP_KERNEL);
+    pages = kmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+    if (unlikely(!pages)) {
+        ret = -ENOMEM;
+        goto out;
+    }
 
     n_user_pages = get_user_pages_fast(addr, npages, 0, pages);
     if (n_user_pages < 0) {
         dev_err(dev, "Failed at get_user_pages(): %d\n", n_user_pages);
+        ret = n_user_pages;
         goto out_free_pages;
     }
 
-    sgl = kcalloc(n_user_pages, sizeof(struct scatterlist *), GFP_KERNEL);
+    sgl = kmalloc_array(n_user_pages, sizeof(struct scatterlist), GFP_KERNEL);
+    if (unlikely(!sgl)) {
+        ret = -ENOMEM;
+        goto out_free_pages;
+    }
+
     sg_init_table(sgl, n_user_pages);
     /* first page */
     sg_set_page(&sgl[0], pages[0], nbytes < (PAGE_SIZE - first_page_offset) ? nbytes : (PAGE_SIZE -first_page_offset) /* len */, offset_in_page(addr));
     /* middle pages */
-    for(int i = 1; i < npages - 1; i++)
+    for(int i = 1; i < n_user_pages - 1; i++)
         sg_set_page(&sgl[i], pages[i], PAGE_SIZE, 0);
     /* last page */
-    if (npages > 1)
-        sg_set_page(&sgl[npages-1], pages[npages-1], nbytes - (PAGE_SIZE - first_page_offset) - ((npages-2)*PAGE_SIZE), 0);
-
+    if (n_user_pages > 1)
+        sg_set_page(&sgl[n_user_pages-1], pages[n_user_pages-1], nbytes - (PAGE_SIZE - first_page_offset) - ((n_user_pages-2)*PAGE_SIZE), 0);
 
     n_sg = dma_map_sg(dev, sgl, n_user_pages, DMA_TO_DEVICE);
+    if (n_sg == 0) {
+        ret = -EIO;
+        goto out_free_sgl;
+    }
     for_each_sg(sgl, sg, n_sg, i) {
         unsigned tries = 0;
-        writeb(UBPF_CMD_PROG_TEXT, p->registers.opcode);
+        writeb(opcode, p->registers.opcode);
         writel(sg_dma_len(sg), p->registers.length);
         writeq(sg_dma_address(sg), p->registers.addr);
         writel(offset, p->registers.offset);
         offset += sg_dma_len(sg);
-        writeb(UBPF_CTRL_START, p->registers.ctrl);
+        writeb(EBPF_CTRL_START, p->registers.ctrl);
+
         /* Check if DMA is finished. This bit will be set by the device */
-        while (!(readb(p->registers.ctrl) & UBPF_CTRL_DMA_DONE)) {
+        while (!(readb(p->registers.ctrl) & EBPF_CTRL_DMA_DONE)) {
             msleep(10);
             if (tries++ >= 10) {
                 dev_err(dev, "DMA timed out\n");
@@ -187,19 +193,24 @@ static void program_text(struct pci_ubpf_dev *p, unsigned long addr, unsigned lo
     }
 
     dma_unmap_sg(dev, sgl, n_user_pages, DMA_TO_DEVICE);
+out_free_sgl:
     kfree(sgl);
 out_free_pages:
     kfree(pages);
+out:
+    return ret;
 }
 
 long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+    int ret = 0;
     struct pci_ubpf_dev *p = filp->private_data;
     struct ebpf_command *ebpf_cmd = (struct ebpf_command *) arg;
 
     switch (ebpf_cmd->opcode) {
-        case UBPF_CMD_PROG_TEXT:
-            program_text(p, ebpf_cmd->addr, ebpf_cmd->length);
+        case EBPF_OFFLOAD_OPCODE_PROG_TEXT:
+        case EBPF_OFFLOAD_OPCODE_PROG_DATA:
+            ret = do_dma(p, ebpf_cmd->opcode, ebpf_cmd->addr, ebpf_cmd->length);
             break;
         default:
             printk("Opcode %d not supported/implemented\n", ebpf_cmd->opcode);
@@ -207,10 +218,10 @@ long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     }
 
     /* dump memory */
-    writeb(UBPF_CMD_DUMP_MEM, p->registers.opcode);
+    writeb(EBPF_OFFLOAD_OPCODE_DUMP_MEM, p->registers.opcode);
     writeb(0x1,  p->registers.ctrl);
 
-    return 0;
+    return ret;
 }
 
 loff_t pci_ubpf_llseek(struct file *filp, loff_t off, int whence)
