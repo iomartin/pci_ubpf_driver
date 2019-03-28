@@ -49,6 +49,8 @@ struct pci_ubpf_dev {
         volatile uint32_t __iomem *length;
         volatile uint32_t __iomem *offset;
         volatile uint64_t __iomem *addr;
+
+        volatile uint64_t __iomem *ret;
     } registers;
     void __iomem *mmio;
 };
@@ -132,6 +134,20 @@ int pci_ubpf_mmap (struct file *filp, struct vm_area_struct *vma)
     unsigned long start = pci_resource_start(p->pdev, BAR);
 
     return vm_iomap_memory(vma, start, bar_len);
+}
+
+static int run_program(struct pci_ubpf_dev *p, uint64_t offset)
+{
+    int finished;
+    volatile uint8_t *ready = p->mmio + 0x200004;
+
+    writeb(EBPF_OFFLOAD_OPCODE_RUN_PROG, p->registers.opcode);
+    writel(offset, p->registers.offset);
+    writeb(EBPF_CTRL_START, p->registers.ctrl);
+
+    finished = watch_and_sleep(ready, 0x1, 100);
+
+    return finished ? readq(p->registers.ret) : -ETIME;
 }
 
 /* Adapted from https://stackoverflow.com/a/5540080 */
@@ -245,6 +261,9 @@ long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         case EBPF_OFFLOAD_OPCODE_MOVE_P2P_DATA:
             copy_p2p(p, ebpf_cmd->opcode, ebpf_cmd->addr, ebpf_cmd->length);
             break;
+        case EBPF_OFFLOAD_OPCODE_RUN_PROG:
+            ret = run_program(p, ebpf_cmd->addr);
+            break;
         case EBPF_OFFLOAD_OPCODE_DUMP_MEM:
             writeb(EBPF_OFFLOAD_OPCODE_DUMP_MEM, p->registers.opcode);
             writeb(0x1,  p->registers.ctrl);
@@ -329,6 +348,7 @@ static struct pci_ubpf_dev *pci_ubpf_create(struct pci_dev *pdev)
     p->registers.length = p->mmio + 1*MiB + 0x4;
     p->registers.offset = p->mmio + 1*MiB + 0x8;
     p->registers.addr   = p->mmio + 1*MiB + 0xc;
+    p->registers.ret    = p->mmio + 2*MiB;
 
     cdev_init(&p->cdev, &pci_ubpf_fops);
     p->cdev.owner = THIS_MODULE;
