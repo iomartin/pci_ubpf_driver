@@ -246,6 +246,12 @@ static int copy_p2p(struct pci_ubpf_dev *p, uint8_t opcode, unsigned long addr, 
     return ret;
 }
 
+static int get_registers(struct pci_ubpf_dev *p, uint64_t addr)
+{
+    int ret = copy_to_user((void *) addr, p->mmio + 0x200008, EBPF_NREGS * 64);
+    return ret == EBPF_NREGS * 64 ? 0 : -EIO;
+}
+
 long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     int ret = 0;
@@ -263,6 +269,9 @@ long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             break;
         case EBPF_OFFLOAD_OPCODE_RUN_PROG:
             ret = run_program(p, ebpf_cmd->addr);
+            break;
+        case EBPF_OFFLOAD_OPCODE_GET_REGS:
+            ret = get_registers(p, ebpf_cmd->addr);
             break;
         case EBPF_OFFLOAD_OPCODE_DUMP_MEM:
             writeb(EBPF_OFFLOAD_OPCODE_DUMP_MEM, p->registers.opcode);
