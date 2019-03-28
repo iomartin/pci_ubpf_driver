@@ -53,6 +53,19 @@ struct pci_ubpf_dev {
     void __iomem *mmio;
 };
 
+static inline bool watch_and_sleep(volatile uint8_t *ptr, uint8_t mask, unsigned long ms)
+{
+    unsigned iters = 100;
+    unsigned long time_per_iter = ms/iters;
+
+    for (unsigned i = 0; i < iters; i++) {
+        if ((readb(ptr) & mask))
+            return 1;
+        msleep(time_per_iter);
+    }
+    return 0;
+}
+
 static struct pci_ubpf_dev *to_pci_ubpf(struct device *dev)
 {
     return container_of(dev, struct pci_ubpf_dev, dev);
@@ -170,7 +183,6 @@ static int do_dma(struct pci_ubpf_dev *p, uint8_t opcode, unsigned long addr, un
         goto out_free_sgl;
     }
     for_each_sg(sgl, sg, n_sg, i) {
-        unsigned tries = 0;
         writeb(opcode, p->registers.opcode);
         writel(sg_dma_len(sg), p->registers.length);
         writeq(sg_dma_address(sg), p->registers.addr);
@@ -179,12 +191,10 @@ static int do_dma(struct pci_ubpf_dev *p, uint8_t opcode, unsigned long addr, un
         writeb(EBPF_CTRL_START, p->registers.ctrl);
 
         /* Check if DMA is finished. This bit will be set by the device */
-        while (!(readb(p->registers.ctrl) & EBPF_CTRL_DMA_DONE)) {
-            msleep(10);
-            if (tries++ >= 10) {
-                dev_err(dev, "DMA timed out\n");
-                break;
-            }
+        if (!watch_and_sleep(p->registers.ctrl, EBPF_CTRL_DMA_DONE, 100)) {
+            dev_err(dev, "DMA timed out\n");
+            ret = -ETIME;
+            break;
         }
     }
 
@@ -201,6 +211,25 @@ out:
     return ret;
 }
 
+static int copy_p2p(struct pci_ubpf_dev *p, uint8_t opcode, unsigned long addr, unsigned long nbytes)
+{
+    int ret = 0;
+    struct device *dev = &p->pdev->dev;
+
+    writeb(opcode, p->registers.opcode);
+    writel(nbytes, p->registers.length);
+    writel(0, p->registers.offset);
+    writeq(addr, p->registers.addr);
+    writeb(EBPF_CTRL_START, p->registers.ctrl);
+
+    if (!watch_and_sleep(p->registers.ctrl, EBPF_CTRL_DMA_DONE, 100)) {
+        dev_err(dev, "Copying data from p2p to internal area timed out\n");
+        ret = -ETIME;
+    }
+
+    return ret;
+}
+
 long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     int ret = 0;
@@ -208,19 +237,22 @@ long pci_ubpf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     struct ebpf_command *ebpf_cmd = (struct ebpf_command *) arg;
 
     switch (ebpf_cmd->opcode) {
-        case EBPF_OFFLOAD_OPCODE_PROG_TEXT:
-        case EBPF_OFFLOAD_OPCODE_PROG_DATA:
+        case EBPF_OFFLOAD_OPCODE_DMA_TEXT:
+        case EBPF_OFFLOAD_OPCODE_DMA_DATA:
             ret = do_dma(p, ebpf_cmd->opcode, ebpf_cmd->addr, ebpf_cmd->length);
             break;
+        case EBPF_OFFLOAD_OPCODE_MOVE_P2P_TEXT:
+        case EBPF_OFFLOAD_OPCODE_MOVE_P2P_DATA:
+            copy_p2p(p, ebpf_cmd->opcode, ebpf_cmd->addr, ebpf_cmd->length);
+            break;
+        case EBPF_OFFLOAD_OPCODE_DUMP_MEM:
+            writeb(EBPF_OFFLOAD_OPCODE_DUMP_MEM, p->registers.opcode);
+            writeb(0x1,  p->registers.ctrl);
         default:
+            ret = -EINVAL;
             printk("Opcode %d not supported/implemented\n", ebpf_cmd->opcode);
             break;
     }
-
-    /* dump memory */
-    writeb(EBPF_OFFLOAD_OPCODE_DUMP_MEM, p->registers.opcode);
-    writeb(0x1,  p->registers.ctrl);
-
     return ret;
 }
 
