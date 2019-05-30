@@ -352,12 +352,12 @@ static struct pci_ubpf_dev *pci_ubpf_create(struct pci_dev *pdev)
         goto out_free;
     }
     p->mmio = pci_iomap(pdev, BAR, pci_resource_len(pdev, BAR));
-    p->registers.opcode = p->mmio + 1*MiB + 0x0;
-    p->registers.ctrl   = p->mmio + 1*MiB + 0x1;
-    p->registers.length = p->mmio + 1*MiB + 0x4;
-    p->registers.offset = p->mmio + 1*MiB + 0x8;
-    p->registers.addr   = p->mmio + 1*MiB + 0xc;
-    p->registers.ret    = p->mmio + 2*MiB;
+    p->registers.opcode = p->mmio + 0x0;
+    p->registers.ctrl   = p->mmio + 0x1;
+    p->registers.length = p->mmio + 0x4;
+    p->registers.offset = p->mmio + 0x8;
+    p->registers.addr   = p->mmio + 0xc;
+    p->registers.ret    = p->mmio + 1*MiB;
 
     cdev_init(&p->cdev, &pci_ubpf_fops);
     p->cdev.owner = THIS_MODULE;
